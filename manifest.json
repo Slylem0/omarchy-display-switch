@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "slylem0.display-switch",
+  "name": "Display Switch",
+  "version": "1.0.0",
+  "author": "Pablo Nicolás Marín",
+  "license": "MIT",
+  "description": "Windows-style projection modes (PC only, duplicate, extend, second screen only) with rotation remembered per device",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Display Switch",
+    "description": "Project to a second screen like Win+P, with per-device rotation",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "language": "auto"
+    },
+    "schema": [
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "Language",
+        "options": ["auto", "en", "es"],
+        "defaultValue": "auto",
+        "description": "auto follows the system locale; en and es force English or Spanish."
+      }
+    ]
+  }
+}

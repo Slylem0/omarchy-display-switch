@@ -1,0 +1,366 @@
+#!/bin/bash
+
+# display-switch: Windows-style projection modes (Win+P) and per-device rotation
+# for Omarchy on Hyprland.
+#
+# The chosen layout is written as Hyprland Lua into Omarchy's toggles directory,
+# which hyprland.lua loads after ~/.config/hypr/monitors.lua. It survives
+# reloads and reboots, and deleting the file (or `display-switch reset`) hands
+# control back to monitors.lua.
+#
+# Rotation is remembered per device (EDID description, or the port when a
+# display sends none), not per port, so a
+# portable monitor mounted upside down keeps its 180° while a projector plugged
+# into the same HDMI port comes up straight.
+
+set -o pipefail
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/display-switch"
+STATE_FILE="$STATE_DIR/state.json"
+TOGGLES_DIR="$STATE_HOME/omarchy/toggles/hypr"
+RULES_FILE="$TOGGLES_DIR/display-switch.lua"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/display-switch.lock"
+
+# Omarchy's own mirror / manual-disable toggles describe a mode too. They load
+# after this plugin's file and would override it, so choosing a mode here
+# clears them. The clamshell toggle (lid closed) is left alone on purpose.
+OMARCHY_MODE_TOGGLES=(internal-monitor-mirror internal-monitor-disable)
+
+MODES=(pc duplicate extend second)
+
+# Tests feed a fixed monitor list and read the generated Lua instead of applying it.
+DRY_RUN="${DISPLAY_SWITCH_DRY_RUN:-0}"
+
+# The bar widget passes its language setting through DISPLAY_SWITCH_LANG;
+# otherwise the locale decides.
+spanish() {
+  case "${DISPLAY_SWITCH_LANG:-auto}" in
+    es) return 0 ;;
+    en) return 1 ;;
+  esac
+  [[ ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} == es* ]]
+}
+
+mode_label() {
+  if spanish; then
+    case "$1" in
+      pc) echo "Solo pantalla del PC" ;;
+      duplicate) echo "Duplicar" ;;
+      extend) echo "Extender" ;;
+      second) echo "Solo segunda pantalla" ;;
+    esac
+  else
+    case "$1" in
+      pc) echo "PC screen only" ;;
+      duplicate) echo "Duplicate" ;;
+      extend) echo "Extend" ;;
+      second) echo "Second screen only" ;;
+    esac
+  fi
+}
+
+notify() {
+  [[ $DRY_RUN == 1 ]] && return 0
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send -g 󰍹 "$1"
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "$1"
+  fi
+}
+
+fail() {
+  echo "display-switch: $*" >&2
+  exit 1
+}
+
+monitors_json() {
+  if [[ -n ${DISPLAY_SWITCH_MONITORS_JSON:-} ]]; then
+    printf '%s\n' "$DISPLAY_SWITCH_MONITORS_JSON"
+  else
+    hyprctl monitors all -j
+  fi
+}
+
+read_state() {
+  if [[ -f $STATE_FILE ]] && jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
+    cat "$STATE_FILE"
+  else
+    echo '{}'
+  fi
+}
+
+write_state() {
+  mkdir -p "$STATE_DIR"
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || fail "cannot write state"
+  printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+# Shared jq prelude: picks the primary display (the laptop panel when there is
+# one, otherwise the first output), the externals, the mode currently on screen,
+# and the stored rotation of each device.
+JQ_PRELUDE='
+  def internal: .name | test("^(eDP|LVDS|DSI)-");
+  def key: if (.description // "") == "" then "output:" + .name else .description end;
+  def logical_w: (if ((.transform // 0) % 2) == 1 then .height else .width end) / ((.scale // 1) | if . <= 0 then 1 else . end);
+  def logical_h: (if ((.transform // 0) % 2) == 1 then .width else .height end) / ((.scale // 1) | if . <= 0 then 1 else . end);
+  ($monitors | sort_by(.id)) as $all
+  | ([$all[] | select(internal)][0] // $all[0]) as $p
+  | [$all[] | select(.name != $p.name)] as $ext
+  | ($state.devices // {}) as $devices
+  | (if ($ext | length) == 0 then "single"
+     elif $p.disabled == true then "second"
+     elif any($ext[]; (.mirrorOf // "none") != "none") then "duplicate"
+     elif all($ext[]; .disabled == true) then "pc"
+     else "extend" end) as $detected
+  | ([$ext[] | select(.disabled != true)][0]) as $e
+  | (if $detected != "extend" or $e == null then ($state.position // "right")
+     elif $e.x >= $p.x + ($p | logical_w) - 1 then "right"
+     elif $e.x + ($e | logical_w) <= $p.x + 1 then "left"
+     elif $e.y >= $p.y + ($p | logical_h) - 1 then "below"
+     elif $e.y + ($e | logical_h) <= $p.y + 1 then "above"
+     else ($state.position // "right") end) as $position
+  | def rotation: ($devices[key].transform // 0);
+'
+
+query() {
+  local monitors="$1" state="$2" filter="$3"
+  shift 3
+  jq -n --argjson monitors "$monitors" --argjson state "$state" "$@" "$JQ_PRELUDE $filter"
+}
+
+# The first time the plugin runs, adopt the rotation each connected display has
+# right now (e.g. a 180° rule in monitors.lua) so nothing flips on install.
+# Later, an unknown device starts at 0°: that is the whole point of remembering
+# rotation per device instead of per port.
+ensure_state() {
+  local monitors="$1" state="$2"
+  if jq -e 'has("devices")' <<<"$state" >/dev/null; then
+    printf '%s\n' "$state"
+    return
+  fi
+  query "$monitors" "$state" '
+    $state + {
+      mode: (if $detected == "single" then "extend" else $detected end),
+      position: $position,
+      devices: (reduce $all[] as $m ({}; .[$m | key] = {transform: ($m.transform // 0)})),
+      connected: ([$all[] | key] | sort)
+    }'
+}
+
+# Emits one `name|mode|position|scale|transform|mirror|disabled` row per output.
+layout_rows() {
+  local monitors="$1" state="$2" mode="$3" position="$4"
+  query "$monitors" "$state" '
+    def mode_string:
+      if (.disabled != true) and ((.mirrorOf // "none") == "none") and ((.width // 0) > 0)
+      then "\(.width)x\(.height)@\(((.refreshRate // 60) * 100 | round) / 100)"
+      else "preferred" end;
+    def scale_value: (.scale // 1) | if . <= 0 then 1 else . end;
+    def on($pos): [.name, mode_string, $pos, scale_value, rotation, "", false];
+    def mirror_of($src): [.name, "preferred", "auto", scale_value, rotation, $src, false];
+    def off: [.name, "", "", "", "", "", true];
+    ({right: "auto-right", left: "auto-left", above: "auto-up", below: "auto-down"}[$pos] // "auto-right") as $auto
+    | (if ($ext | length) == 0 then ($p | on("0x0"))
+       elif $mode == "pc" then ($p | on("0x0")), ($ext[] | off)
+       elif $mode == "duplicate" then ($p | on("0x0")), ($ext[] | mirror_of($p.name))
+       elif $mode == "second" then ($p | off), ($ext[0] | on("0x0")), ($ext[1:][] | on("auto-right"))
+       else ($p | on("0x0")), ($ext[] | on($auto)) end)
+    | map(tostring) | join("|")
+  ' --arg mode "$mode" --arg pos "$position" -r
+}
+
+# Every value below ends up inside generated Lua that Hyprland executes, so each
+# one is checked against a strict pattern before it is written. A user-created
+# headless output can carry any name; refusing it is safer than quoting it.
+render_lua() {
+  local name mode position scale transform mirror disabled
+  echo "-- Generated by the display-switch Omarchy plugin. Do not edit by hand:"
+  echo "-- it is rewritten on every change. Run \`display-switch reset\` (or delete"
+  echo "-- this file and reload Hyprland) to go back to ~/.config/hypr/monitors.lua."
+  while IFS='|' read -r name mode position scale transform mirror disabled; do
+    [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || fail "refusing unsafe monitor name: $name"
+    if [[ $disabled == true ]]; then
+      printf 'hl.monitor({ output = "%s", disabled = true })\n' "$name"
+      continue
+    fi
+    [[ $mode =~ ^(preferred|[0-9]+x[0-9]+(@[0-9]+(\.[0-9]+)?)?)$ ]] || fail "unexpected mode for $name: $mode"
+    [[ $position =~ ^(0x0|auto|auto-(right|left|up|down))$ ]] || fail "unexpected position for $name: $position"
+    [[ $scale =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "unexpected scale for $name: $scale"
+    [[ $transform =~ ^[0-7]$ ]] || fail "unexpected transform for $name: $transform"
+    if [[ -n $mirror ]]; then
+      [[ $mirror =~ ^[A-Za-z0-9._-]+$ ]] || fail "refusing unsafe monitor name: $mirror"
+      printf 'hl.monitor({ output = "%s", mode = "%s", position = "%s", scale = %s, transform = %s, mirror = "%s" })\n' \
+        "$name" "$mode" "$position" "$scale" "$transform" "$mirror"
+    else
+      printf 'hl.monitor({ output = "%s", mode = "%s", position = "%s", scale = %s, transform = %s })\n' \
+        "$name" "$mode" "$position" "$scale" "$transform"
+    fi
+  done
+}
+
+apply_layout() {
+  local monitors="$1" state="$2" mode="$3" position="$4" lua tmp toggle
+  lua=$(layout_rows "$monitors" "$state" "$mode" "$position" | render_lua) || exit 1
+
+  if [[ $DRY_RUN == 1 ]]; then
+    printf '%s\n' "$lua"
+    return 0
+  fi
+
+  mkdir -p "$TOGGLES_DIR"
+  tmp=$(mktemp "$TOGGLES_DIR/.display-switch.XXXXXX") || fail "cannot write $RULES_FILE"
+  printf '%s\n' "$lua" >"$tmp" && mv -f "$tmp" "$RULES_FILE"
+  for toggle in "${OMARCHY_MODE_TOGGLES[@]}"; do
+    rm -f "$TOGGLES_DIR/$toggle.lua"
+  done
+  hyprctl reload >/dev/null
+}
+
+# Re-reads monitors and stored state, records the given changes, and applies.
+commit() {
+  local state="$1" mode="$2" position="$3" monitors
+  monitors=$(monitors_json) || fail "cannot query Hyprland monitors"
+  state=$(query "$monitors" "$state" '$state | .mode = $m | .position = $pos | .connected = ([$all[] | key] | sort)' \
+    --arg m "$mode" --arg pos "$position")
+  [[ $DRY_RUN == 1 ]] || write_state "$state"
+  apply_layout "$monitors" "$state" "$mode" "$position"
+}
+
+load() {
+  MONITORS=$(monitors_json) || fail "cannot query Hyprland monitors"
+  STATE=$(ensure_state "$MONITORS" "$(read_state)") || fail "cannot read state"
+  DETECTED=$(query "$MONITORS" "$STATE" '$detected' -r)
+  POSITION=$(query "$MONITORS" "$STATE" '$position' -r)
+}
+
+valid_mode() {
+  local m
+  for m in "${MODES[@]}"; do [[ $1 == "$m" ]] && return 0; done
+  return 1
+}
+
+cmd_state() {
+  load
+  query "$MONITORS" "$STATE" '{
+    mode: $detected,
+    storedMode: ($state.mode // "extend"),
+    position: $position,
+    hasExternal: (($ext | length) > 0),
+    primary: $p.name,
+    monitors: [$all[] | {
+      name,
+      description,
+      label: ([.make, .model] | map(select(. != null and . != "")) | join(" ") | if . == "" then null else . end) // .name,
+      internal: internal,
+      primary: (.name == $p.name),
+      enabled: (.disabled != true),
+      mirrorOf: (.mirrorOf // "none"),
+      transform: ($devices[key].transform // .transform // 0)
+    }]
+  }' -c
+}
+
+cmd_mode() {
+  local mode="$1"
+  valid_mode "$mode" || fail "unknown mode '$mode' (expected: ${MODES[*]})"
+  load
+  if [[ $DETECTED == single && $mode != pc ]]; then
+    if spanish; then notify "No hay ninguna pantalla externa conectada"; else notify "No external display connected"; fi
+    exit 1
+  fi
+  commit "$STATE" "$mode" "$POSITION"
+  notify "$(mode_label "$mode")"
+}
+
+cmd_cycle() {
+  load
+  if [[ $DETECTED == single ]]; then
+    if spanish; then notify "No hay ninguna pantalla externa conectada"; else notify "No external display connected"; fi
+    exit 1
+  fi
+  local i next=extend
+  for i in "${!MODES[@]}"; do
+    [[ ${MODES[$i]} == "$DETECTED" ]] && next=${MODES[$(((i + 1) % ${#MODES[@]}))]}
+  done
+  cmd_mode "$next"
+}
+
+cmd_position() {
+  local position="$1"
+  [[ $position =~ ^(left|right|above|below)$ ]] || fail "unknown position '$position' (expected: left right above below)"
+  load
+  [[ $DETECTED == single ]] && fail "no external display connected"
+  # Picking a side only means something while extended, as in Windows.
+  commit "$STATE" extend "$position"
+}
+
+cmd_rotate() {
+  local output="$1" transform="$2" device mode
+  [[ $transform =~ ^[0-7]$ ]] || fail "transform must be 0-7 (0 normal, 1 90°, 2 180°, 3 270°, 4-7 flipped)"
+  load
+  device=$(query "$MONITORS" "$STATE" '[$all[] | select(.name == $name) | key][0] // empty' --arg name "$output" -r)
+  [[ -n $device ]] || fail "unknown output '$output'"
+  STATE=$(jq --arg d "$device" --argjson t "$transform" '.devices[$d] = {transform: $t}' <<<"$STATE")
+  mode=$DETECTED
+  [[ $mode == single ]] && mode=$(jq -r '.mode // "extend"' <<<"$STATE")
+  commit "$STATE" "$mode" "$POSITION"
+}
+
+# Called by the bar widget whenever Hyprland adds or removes an output. It only
+# acts when the set of connected devices changed, so the reload it triggers (and
+# the monitor events that reload fires) settle into a no-op.
+cmd_sync() {
+  exec 9>"$LOCK_FILE"
+  flock -w 5 9 || exit 0
+  local first_run=0 connected
+  [[ -f $STATE_FILE ]] || first_run=1
+  load
+  connected=$(query "$MONITORS" "$STATE" '[$all[] | key] | sort' -c)
+  if ((first_run)); then
+    [[ $DRY_RUN == 1 ]] || write_state "$STATE"
+    return 0
+  fi
+  jq -e --argjson c "$connected" '.connected == $c' <<<"$STATE" >/dev/null && return 0
+  commit "$STATE" "$(jq -r '.mode // "extend"' <<<"$STATE")" "$(jq -r '.position // "right"' <<<"$STATE")"
+}
+
+cmd_reset() {
+  rm -f "$RULES_FILE"
+  hyprctl reload >/dev/null
+  if spanish; then notify "Configuración de pantallas restablecida"; else notify "Display layout reset to monitors.lua"; fi
+}
+
+usage() {
+  cat <<USAGE
+Usage: display-switch <command>
+
+  pc | duplicate | extend | second   Switch projection mode (like Win+P)
+  cycle                              Go to the next mode
+  position <left|right|above|below>  Where the external display sits when extended
+  rotate <output> <0-7>              Rotate a display; remembered per device
+                                     (0 normal, 1 90°, 2 180°, 3 270°, 4-7 flipped)
+  state                              Print the current state as JSON
+  sync                               Re-apply after a display was (dis)connected
+  reset                              Remove the generated rules, back to monitors.lua
+USAGE
+}
+
+command -v jq >/dev/null 2>&1 || fail "jq is required"
+
+case "${1:-}" in
+  pc | duplicate | extend | second) cmd_mode "$1" ;;
+  mode) cmd_mode "${2:-}" ;;
+  cycle) cmd_cycle ;;
+  position) cmd_position "${2:-}" ;;
+  rotate) cmd_rotate "${2:-}" "${3:-}" ;;
+  state) cmd_state ;;
+  sync) cmd_sync ;;
+  reset) cmd_reset ;;
+  -h | --help | help | "") usage ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

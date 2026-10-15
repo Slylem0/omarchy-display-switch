@@ -1,0 +1,99 @@
+#!/bin/bash
+
+# Runs the helper against fake monitor lists in dry-run mode (it prints the Lua
+# it would write instead of touching Hyprland), then the Model.js unit tests.
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+HELPER="$ROOT/bin/display-switch"
+failures=0
+
+export DISPLAY_SWITCH_DRY_RUN=1
+export DISPLAY_SWITCH_LANG=en
+XDG_STATE_HOME=$(mktemp -d)
+export XDG_STATE_HOME
+trap 'rm -rf "$XDG_STATE_HOME"' EXIT
+
+laptop='{"id":0,"name":"eDP-1","description":"Chimei Innolux 0x161A","make":"Chimei Innolux","model":"0x161A","width":1920,"height":1080,"refreshRate":144.003,"x":0,"y":0,"scale":1,"transform":0,"disabled":false,"mirrorOf":"none"}'
+arzopa='{"id":1,"name":"HDMI-A-1","description":"GWD ARZOPA 0000","make":"GWD","model":"ARZOPA","width":1920,"height":1080,"refreshRate":60,"x":1920,"y":0,"scale":1,"transform":2,"disabled":false,"mirrorOf":"none"}'
+projector='{"id":1,"name":"HDMI-A-1","description":"Epson Projector","make":"Epson","model":"Projector","width":1280,"height":800,"refreshRate":60,"x":1920,"y":0,"scale":1,"transform":0,"disabled":false,"mirrorOf":"none"}'
+
+check() {
+  local name="$1" output="$2" pattern="$3"
+  if grep -qF -- "$pattern" <<<"$output"; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: expected '$pattern' in:"
+    printf '%s\n' "$output" | sed 's/^/       /'
+    failures=$((failures + 1))
+  fi
+}
+
+run() {
+  DISPLAY_SWITCH_MONITORS_JSON="$1" "$HELPER" "${@:2}" 2>&1
+}
+
+# First run adopts the rotation already on screen (the ARZOPA is mounted 180°).
+mkdir -p "$XDG_STATE_HOME/display-switch"
+state=$(DISPLAY_SWITCH_MONITORS_JSON="[$laptop,$arzopa]" "$HELPER" state)
+check "first run adopts current rotation" "$state" '"transform":2'
+check "detects extend to the right" "$state" '"position":"right"'
+
+out=$(run "[$laptop,$arzopa]" duplicate)
+check "duplicate mirrors the laptop" "$out" 'mirror = "eDP-1"'
+check "duplicate keeps the ARZOPA flipped" "$out" 'output = "HDMI-A-1", mode = "preferred", position = "auto", scale = 1, transform = 2'
+
+out=$(run "[$laptop,$arzopa]" pc)
+check "pc disables the external" "$out" 'hl.monitor({ output = "HDMI-A-1", disabled = true })'
+
+out=$(run "[$laptop,$arzopa]" second)
+check "second disables the laptop" "$out" 'hl.monitor({ output = "eDP-1", disabled = true })'
+check "second puts the external at the origin" "$out" 'output = "HDMI-A-1", mode = "1920x1080@60", position = "0x0"'
+
+out=$(run "[$laptop,$arzopa]" position above)
+check "position above uses auto-up" "$out" 'position = "auto-up"'
+
+# A projector on the same port must come up straight: rotation is per device.
+printf '{"mode":"duplicate","position":"right","devices":{"GWD ARZOPA 0000":{"transform":2}},"connected":[]}\n' \
+  >"$XDG_STATE_HOME/display-switch/state.json"
+out=$(run "[$laptop,$projector]" duplicate)
+check "projector on the same port is not flipped" "$out" 'output = "HDMI-A-1", mode = "preferred", position = "auto", scale = 1, transform = 0, mirror = "eDP-1"'
+
+out=$(run "[$laptop,$arzopa]" duplicate)
+check "the ARZOPA keeps its own 180°" "$out" 'transform = 2, mirror = "eDP-1"'
+
+# Only the laptop: every mode collapses to the laptop alone.
+if out=$(run "[$laptop]" duplicate) || grep -q '^hl.monitor' <<<"$out"; then
+  echo "FAIL duplicate without an external display should be refused"
+  failures=$((failures + 1))
+else
+  echo "ok   duplicate without external is refused"
+fi
+out=$(DISPLAY_SWITCH_MONITORS_JSON="[$laptop]" "$HELPER" pc)
+check "pc with only the laptop keeps it on" "$out" 'output = "eDP-1", mode = "1920x1080@144", position = "0x0"'
+
+# Generated Lua is executed by Hyprland: hostile names must be refused.
+evil='{"id":1,"name":"HDMI\")os.execute(\"x","description":"evil","make":"","model":"","width":1,"height":1,"refreshRate":60,"x":0,"y":0,"scale":1,"transform":0,"disabled":false,"mirrorOf":"none"}'
+out=$(run "[$laptop,$evil]" extend)
+check "unsafe monitor names are refused" "$out" 'refusing unsafe monitor name'
+if grep -q 'os.execute' <<<"$out" && grep -q '^hl.monitor' <<<"$out"; then
+  echo "FAIL unsafe name leaked into Lua"
+  failures=$((failures + 1))
+fi
+
+out=$(run "[$laptop,$arzopa]" rotate HDMI-A-1 9)
+check "invalid transform is rejected" "$out" 'transform must be 0-7'
+
+# Model.js unit tests (pure JS, shared with the QML).
+if command -v node >/dev/null 2>&1; then
+  node "$ROOT/test/model.test.js" || failures=$((failures + 1))
+else
+  echo "skip Model.js tests (node not installed)"
+fi
+
+if ((failures)); then
+  echo "$failures failure(s)"
+  exit 1
+fi
+echo "all tests passed"
