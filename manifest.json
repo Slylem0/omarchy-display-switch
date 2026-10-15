@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "slylem0.display-switch",
   "name": "Display Switch",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Pablo Nicolás Marín",
   "license": "MIT",
-  "description": "Windows-style projection modes (PC only, duplicate, extend, second screen only) with brightness, rotation and scale remembered per display",
+  "description": "Win+P for Omarchy: PC only, duplicate, extend or second screen only, with brightness (even on monitors without DDC/CI), rotation and scale that follow each display instead of the port.",
   "kinds": [
     "service",
     "bar-widget"
