@@ -21,25 +21,55 @@ Panel {
   readonly property bool busy: hostWidget ? hostWidget.busy : false
   readonly property bool hasExternal: status.hasExternal
   readonly property bool showPosition: hasExternal && status.mode === "extend"
-  readonly property var rotatable: status.monitors.filter(function(m) { return m.enabled })
+  readonly property var displays: status.monitors.filter(function(m) { return m.enabled })
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color accent: Color.accent
   readonly property color dim: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.65)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property int inset: Style.space(14)
 
-  // One flat cursor across every interactive row: the four modes, then the
-  // position picker (only while extended), then one rotation row per display.
-  // j/k walk rows; h/l change the value of a picker row and apply it at once.
+  // One flat cursor across every interactive row: the four modes, the
+  // position picker (only while extended), then brightness, rotation and scale
+  // for each display, then text size. j/k walk rows; h/l change the value of a
+  // slider or picker row and apply it at once.
   readonly property var rows: {
     var list = []
     for (var i = 0; i < Model.MODES.length; i++) list.push({ type: "mode", value: Model.MODES[i] })
     if (showPosition) list.push({ type: "position" })
-    for (var j = 0; j < rotatable.length; j++) list.push({ type: "rotate", name: rotatable[j].name })
+    for (var j = 0; j < displays.length; j++) {
+      var name = displays[j].name
+      if (brightnessAdjustable(displays[j])) list.push({ type: "brightness", name: name })
+      list.push({ type: "rotate", name: name })
+      if (displays[j].mirrorOf === "none") list.push({ type: "scale", name: name })
+    }
+    list.push({ type: "textsize" })
     return list
   }
   property int cursorIndex: 0
   property bool cursorActive: false
+
+  // While a text size change lands, show the chosen stop instead of snapping
+  // back to the old size.
+  property int textSizePending: -1
+  readonly property int textSizeIndex: textSizePending >= 0 ? textSizePending : Model.nearestIndex(Model.TEXT_SIZE_STOPS, Style.font.baseSize)
+
+  // Software dimming works by drawing over a screen, which a mirrored output
+  // does not have of its own.
+  function brightnessAdjustable(monitor) {
+    if (!monitor || monitor.brightnessBackend === "unknown") return false
+    return !(monitor.brightnessBackend === "software" && monitor.mirrorOf !== "none")
+  }
+
+  function brightnessOf(monitor) {
+    return monitor && monitor.brightness !== null && monitor.brightness !== undefined ? monitor.brightness : 100
+  }
+
+  function setTextSizeIndex(index) {
+    var i = Math.max(0, Math.min(Model.TEXT_SIZE_STOPS.length - 1, index))
+    textSizePending = i
+    textSizeSettle.restart()
+    if (hostWidget) hostWidget.setTextSize(Model.TEXT_SIZE_STOPS[i])
+  }
 
   function tr(key) { return Model.tr(root.lang, key) }
 
@@ -73,9 +103,20 @@ Panel {
     if (!row || !hostWidget || dx === 0) return
     if (row.type === "position") {
       hostWidget.setPosition(Model.POSITIONS[Model.nextIndex(Model.POSITIONS, status.position, dx > 0 ? 1 : -1)])
-    } else if (row.type === "rotate") {
+    } else if (row.type === "textsize") {
+      setTextSizeIndex(textSizeIndex + (dx > 0 ? 1 : -1))
+    } else {
       var monitor = monitorNamed(row.name)
-      if (monitor) hostWidget.rotate(monitor.name, Model.ROTATIONS[Model.nextIndex(Model.ROTATIONS, monitor.transform % 4, dx > 0 ? 1 : -1)])
+      if (!monitor) return
+      if (row.type === "rotate") {
+        hostWidget.rotate(monitor.name, Model.ROTATIONS[Model.nextIndex(Model.ROTATIONS, monitor.transform % 4, dx > 0 ? 1 : -1)])
+      } else if (row.type === "brightness") {
+        hostWidget.setBrightness(monitor.name, Math.max(Model.minBrightness(monitor), brightnessOf(monitor) + (dx > 0 ? 5 : -5)))
+      } else if (row.type === "scale") {
+        var scales = Model.scaleOptions(monitor)
+        var next = Model.nearestIndex(scales, monitor.scale) + (dx > 0 ? 1 : -1)
+        if (next >= 0 && next < scales.length) hostWidget.setScale(monitor.name, scales[next])
+      }
     }
   }
 
@@ -96,6 +137,12 @@ Panel {
 
   onRowsChanged: if (cursorIndex > rows.length - 1) cursorIndex = Math.max(0, rows.length - 1)
 
+  Timer {
+    id: textSizeSettle
+    interval: 1500
+    onTriggered: root.textSizePending = -1
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -104,8 +151,8 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     padding: Style.space(20)
-    contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(640))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(760))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -297,7 +344,7 @@ Panel {
 
             PanelSectionHeader {
               Layout.leftMargin: root.inset
-              text: root.tr("rotation")
+              text: root.tr("displays")
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -306,7 +353,7 @@ Panel {
               Layout.fillWidth: true
               Layout.rightMargin: root.inset
               horizontalAlignment: Text.AlignRight
-              text: root.tr("rotationHint")
+              text: root.tr("displaysHint")
               textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
@@ -315,50 +362,241 @@ Panel {
             }
           }
 
-          Item { width: 1; height: Style.space(6) }
+          Item { width: 1; height: Style.space(8) }
 
           Column {
-            id: rotationList
+            id: displayList
             width: parent.width
-            spacing: Style.space(10)
+            spacing: Style.space(16)
 
+            // Indexed by position rather than by the monitor objects, so a
+            // state refresh updates each card in place instead of rebuilding
+            // it (which would cut a slider drag short).
             Repeater {
-              model: root.rotatable
+              model: root.displays.length
 
               Column {
-                id: rotationRow
-                required property var modelData
-                readonly property int row: root.rowIndex("rotate", modelData.name)
-                width: rotationList.width
+                id: card
+                required property int index
+                readonly property var monitor: root.displays[index] || ({})
+                readonly property bool mirrored: (monitor.mirrorOf || "none") !== "none"
+                readonly property bool software: monitor.brightnessBackend === "software"
+                readonly property var scales: Model.scaleOptions(monitor)
+                readonly property int brightnessRow: root.rowIndex("brightness", monitor.name)
+                readonly property int rotateRow: root.rowIndex("rotate", monitor.name)
+                readonly property int scaleRow: root.rowIndex("scale", monitor.name)
+                width: displayList.width
                 spacing: Style.space(6)
 
                 Text {
                   width: parent.width
                   leftPadding: root.inset
                   rightPadding: root.inset
-                  text: Model.displayName(root.lang, rotationRow.modelData) + "  ·  " + rotationRow.modelData.name
-                    + (rotationRow.modelData.mirrorOf !== "none" ? "  →  " + rotationRow.modelData.mirrorOf : "")
+                  text: Model.displayName(root.lang, card.monitor) + "  ·  " + card.monitor.name
+                    + (card.mirrored ? "  →  " + card.monitor.mirrorOf : "")
                   textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
+                  font.bold: true
                   elide: Text.ElideRight
                 }
 
-                ButtonGroup {
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.spacing.controlGap
+
+                  Text {
+                    Layout.leftMargin: root.inset
+                    Layout.fillWidth: true
+                    text: root.tr("brightness") + (card.software && !card.mirrored ? "  ·  " + root.tr("softwareDim") : "")
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    Layout.rightMargin: root.inset
+                    visible: root.brightnessAdjustable(card.monitor)
+                    text: Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightnessOf(card.monitor)) + "%"
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+
+                CursorSurface {
                   x: root.inset
-                  spacing: Style.space(6)
-                  focusable: false
+                  width: parent.width - root.inset * 2
+                  height: brightnessSlider.implicitHeight + Style.spacing.controlGap
+                  visible: root.brightnessAdjustable(card.monitor)
+                  hasCursor: root.cursorActive && root.cursorIndex === card.brightnessRow
                   foreground: root.foreground
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  value: String(rotationRow.modelData.transform % 4)
-                  options: Model.ROTATIONS.map(function(t) { return { value: String(t), label: Model.rotationLabel(t) } })
-                  cursorIndex: root.cursorActive && root.cursorIndex === rotationRow.row ? rotationRow.modelData.transform % 4 : -1
-                  onHovered: function(index, isHovered) { if (isHovered) { root.cursorActive = true; root.cursorIndex = rotationRow.row } }
-                  onChanged: function(value) { if (root.hostWidget) root.hostWidget.rotate(rotationRow.modelData.name, Number(value)) }
+                  outline: true
+
+                  PanelSlider {
+                    id: brightnessSlider
+                    bar: root.bar
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(6)
+                    anchors.rightMargin: Style.space(6)
+                    minimum: Model.minBrightness(card.monitor)
+                    maximum: 100
+                    step: 1
+                    integer: true
+                    value: root.brightnessOf(card.monitor)
+                    onMoved: function(v) { if (root.hostWidget) root.hostWidget.setBrightness(card.monitor.name, v) }
+                    onReleased: function(v) { if (root.hostWidget) root.hostWidget.setBrightness(card.monitor.name, v) }
+                  }
+
+                  HoverHandler {
+                    onHoveredChanged: if (hovered) { root.cursorActive = true; root.cursorIndex = card.brightnessRow }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  leftPadding: root.inset
+                  rightPadding: root.inset
+                  visible: !root.brightnessAdjustable(card.monitor)
+                  text: card.monitor.brightnessBackend === "unknown" ? root.tr("detecting") : root.tr("mirrorDim")
+                  textFormat: Text.PlainText
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.italic: true
+                  elide: Text.ElideRight
+                }
+
+                Item { width: 1; height: Style.space(2) }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.spacing.controlGap
+
+                  Text {
+                    Layout.leftMargin: root.inset
+                    Layout.preferredWidth: Style.space(64)
+                    text: root.tr("rotation")
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+
+                  ButtonGroup {
+                    spacing: Style.space(4)
+                    focusable: false
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    value: String((card.monitor.transform || 0) % 4)
+                    options: Model.ROTATIONS.map(function(t) { return { value: String(t), label: Model.rotationLabel(t) } })
+                    cursorIndex: root.cursorActive && root.cursorIndex === card.rotateRow ? (card.monitor.transform || 0) % 4 : -1
+                    onHovered: function(index, isHovered) { if (isHovered) { root.cursorActive = true; root.cursorIndex = card.rotateRow } }
+                    onChanged: function(value) { if (root.hostWidget) root.hostWidget.rotate(card.monitor.name, Number(value)) }
+                  }
+
+                  Item { Layout.fillWidth: true }
+                }
+
+                RowLayout {
+                  width: parent.width
+                  visible: !card.mirrored
+                  spacing: Style.spacing.controlGap
+
+                  Text {
+                    Layout.leftMargin: root.inset
+                    Layout.preferredWidth: Style.space(64)
+                    text: root.tr("scale")
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+
+                  ButtonGroup {
+                    readonly property int current: Model.nearestIndex(card.scales, card.monitor.scale)
+                    spacing: Style.space(4)
+                    focusable: false
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    value: String(card.scales[current])
+                    options: card.scales.map(function(sc) { return { value: String(sc), label: Model.scaleLabel(sc) } })
+                    cursorIndex: root.cursorActive && root.cursorIndex === card.scaleRow ? current : -1
+                    onHovered: function(index, isHovered) { if (isHovered) { root.cursorActive = true; root.cursorIndex = card.scaleRow } }
+                    onChanged: function(value) { if (root.hostWidget) root.hostWidget.setScale(card.monitor.name, Number(value)) }
+                  }
+
+                  Item { Layout.fillWidth: true }
                 }
               }
+            }
+          }
+
+          Item { width: 1; height: Style.space(12) }
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+          Item { width: 1; height: Style.space(10) }
+
+          RowLayout {
+            width: parent.width
+            spacing: Style.spacing.controlGap
+
+            PanelSectionHeader {
+              Layout.leftMargin: root.inset
+              Layout.fillWidth: true
+              text: root.tr("textSize")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              Layout.rightMargin: root.inset
+              text: Model.TEXT_SIZE_STOPS[textSizeSlider.dragging ? Math.round(textSizeSlider.liveValue) : root.textSizeIndex] + "px"
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+
+          Item { width: 1; height: Style.space(6) }
+
+          CursorSurface {
+            x: root.inset
+            width: parent.width - root.inset * 2
+            height: textSizeSlider.implicitHeight + Style.spacing.controlGap
+            hasCursor: root.cursorActive && root.cursorIndex === root.rowIndex("textsize")
+            foreground: root.foreground
+            outline: true
+
+            PanelSlider {
+              id: textSizeSlider
+              bar: root.bar
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(6)
+              anchors.rightMargin: Style.space(6)
+              minimum: 0
+              maximum: Model.TEXT_SIZE_STOPS.length - 1
+              step: 1
+              integer: true
+              tickCount: Model.TEXT_SIZE_STOPS.length
+              value: root.textSizeIndex
+              onReleased: function(v) { root.setTextSizeIndex(Math.round(v)) }
+            }
+
+            HoverHandler {
+              onHoveredChanged: if (hovered) { root.cursorActive = true; root.cursorIndex = root.rowIndex("textsize") }
             }
           }
 

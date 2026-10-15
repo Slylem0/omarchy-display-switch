@@ -2,8 +2,8 @@
 
 Project to a second screen the way Windows does with <kbd>Win</kbd>+<kbd>P</kbd>:
 **PC screen only**, **Duplicate**, **Extend** and **Second screen only**, from a
-bar widget, a keyboard shortcut or the terminal. Each display's rotation is
-remembered **per device**, not per port.
+bar widget, a keyboard shortcut or the terminal. Each display's brightness,
+rotation and scale are remembered **per device**, not per port.
 
 ![Display Switch panel](preview.png)
 
@@ -24,7 +24,10 @@ straight, in every mode, including Duplicate.
 
 - Four projection modes, like Windows: PC only, Duplicate, Extend, Second screen only
 - Where the external display sits when extending: left, right, above, below
-- 0° / 90° / 180° / 270° rotation per display, remembered per device
+- Brightness per display: the real backlight or DDC/CI when the display has it,
+  software dimming when it doesn't (most portable monitors and projectors)
+- 0° / 90° / 180° / 270° rotation and scale per display, remembered per device
+- Text size for the whole desktop, like Omarchy's display panel
 - Duplicate honours the target display's rotation
 - Re-applies your last mode when a display is plugged in or removed. If you unplug
   while on *Second screen only*, the laptop panel turns back on by itself.
@@ -75,7 +78,9 @@ the bar (`--enable` puts it there).
 | Open the panel | Click the bar icon, or your shortcut |
 | Pick a mode | Click it, or press <kbd>1</kbd>–<kbd>4</kbd> |
 | Next mode | Right-click the bar icon |
-| Rotate a display | Click 0° / 90° / 180° / 270° under *Rotation*, or select the row and use <kbd>←</kbd>/<kbd>→</kbd> |
+| Change a display's brightness | Drag its *Brightness* slider, or select it and use <kbd>←</kbd>/<kbd>→</kbd> |
+| Rotate or scale a display | Click a value under *Rotation* or *Scale*, or select the row and use <kbd>←</kbd>/<kbd>→</kbd> |
+| Text size | The *Text size* slider at the bottom |
 | Move the external display | *External display position* (shown while extended) |
 
 ### From the terminal
@@ -86,6 +91,8 @@ $DS duplicate            # pc | duplicate | extend | second
 $DS cycle                # next mode
 $DS position left        # left | right | above | below
 $DS rotate HDMI-A-1 2    # 0 normal, 1 90°, 2 180°, 3 270°, 4-7 flipped
+$DS scale HDMI-A-1 1.25  # 0.5 to 4
+$DS brightness HDMI-A-1 70
 $DS state                # JSON
 $DS reset                # drop the generated rules, back to monitors.lua
 ```
@@ -98,10 +105,24 @@ file in that folder after `~/.config/hypr/monitors.lua` (it is the same mechanis
 Omarchy's own toggles use), so these rules win for the displays that are
 connected, and your `monitors.lua` stays the fallback for everything else.
 
-Per-device rotation and your last mode live in
+Per-device rotation, scale, brightness and your last mode live in
 `~/.local/state/display-switch/state.json`. The first time it runs, the plugin
 adopts the rotation each connected display already has, so nothing flips on
 install. Devices it sees later start at 0° until you rotate them.
+
+### Brightness
+
+For each display the plugin checks once whether it can control the real
+brightness, using Omarchy's `omarchy-brightness-display` (laptop backlight,
+DDC/CI monitors, Apple displays). External monitors need DDC/CI turned on in
+their own menu, `ddcutil`, and access to `/dev/i2c-*`. The check can take a few
+seconds on a display without DDC/CI; the answer is remembered.
+
+When there is no hardware control, the display is dimmed in software: the
+plugin's shell service draws a black, click-through layer over that screen.
+It never goes below 10% so a screen can't be lost, it shows up in screenshots
+and recordings of that screen, and it can't apply to a screen while it is the
+mirror target in *Duplicate* (dim the source instead).
 
 Choosing a mode clears Omarchy's own mirror / disable-laptop toggles so the two
 don't fight. Omarchy's lid-closed (clamshell) handling is left untouched and
@@ -136,7 +157,9 @@ instead of applying it, and `DISPLAY_SWITCH_MONITORS_JSON` feeds it a fake
 
 Proyecta a una segunda pantalla como en Windows con <kbd>Win</kbd>+<kbd>P</kbd>:
 **Solo pantalla del PC**, **Duplicar**, **Extender** y **Solo segunda pantalla**.
-El giro de cada pantalla se recuerda **por dispositivo**, no por puerto. Tu
+El brillo, el giro y la escala de cada pantalla se recuerdan **por dispositivo**,
+no por puerto. El brillo usa el control real de la pantalla (portátil o DDC/CI)
+y, si no lo tiene, la atenúa por software. Tu
 monitor portátil montado al revés sigue a 180° y el proyector de la universidad,
 en el mismo HDMI, sale derecho, también al duplicar.
 

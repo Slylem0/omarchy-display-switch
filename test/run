@@ -85,6 +85,37 @@ fi
 out=$(run "[$laptop,$arzopa]" rotate HDMI-A-1 9)
 check "invalid transform is rejected" "$out" 'transform must be 0-7'
 
+# Scale is stored per device and lands in the generated rule.
+printf '{"mode":"extend","position":"right","devices":{"GWD ARZOPA 0000":{"transform":2,"scale":1.25}},"connected":[]}\n' \
+  >"$XDG_STATE_HOME/display-switch/state.json"
+out=$(run "[$laptop,$arzopa]" extend)
+check "stored scale is applied" "$out" 'output = "HDMI-A-1", mode = "1920x1080@60", position = "auto-right", scale = 1.25, transform = 2'
+out=$(run "[$laptop,$projector]" extend)
+check "projector does not inherit the ARZOPA scale" "$out" 'output = "HDMI-A-1", mode = "1280x800@60", position = "auto-right", scale = 1, transform = 0'
+out=$(run "[$laptop,$arzopa]" scale HDMI-A-1 9)
+check "out of range scale is rejected" "$out" 'scale must be a number between 0.5 and 4'
+
+# Brightness: a fake omarchy-brightness-display where only the laptop panel
+# has a backlight, so the ARZOPA falls back to software dimming.
+fake=$(mktemp)
+cat >"$fake" <<'FAKE'
+#!/bin/bash
+while [[ $1 == --* ]]; do [[ $1 == --monitor ]] && { m=$2; shift; }; shift; done
+[[ $m == eDP-* ]] || exit 1
+[[ -n ${1:-} ]] || echo 80
+FAKE
+chmod +x "$fake"
+export DISPLAY_SWITCH_BRIGHTNESS_CMD="$fake"
+out=$(run "[$laptop,$arzopa]" probe)
+check "laptop panel uses the backlight" "$out" '"Chimei Innolux 0x161A":{"backend":"hardware"}'
+check "display without DDC/CI falls back to software" "$out" '"GWD ARZOPA 0000":{"transform":2,"scale":1.25,"backend":"software"}'
+out=$(run "[$laptop,$arzopa]" brightness HDMI-A-1 4)
+check "software dimming never goes below 10%" "$out" '"dim":10'
+out=$(run "[$laptop,$arzopa]" brightness HDMI-A-1 0)
+check "brightness 0 is rejected" "$out" 'brightness must be 1-100'
+rm -f "$fake"
+unset DISPLAY_SWITCH_BRIGHTNESS_CMD
+
 # Model.js unit tests (pure JS, shared with the QML).
 if command -v node >/dev/null 2>&1; then
   node "$ROOT/test/model.test.js" || failures=$((failures + 1))

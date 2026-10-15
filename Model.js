@@ -4,6 +4,11 @@
 var MODES = ["pc", "duplicate", "extend", "second"]
 var POSITIONS = ["left", "right", "above", "below"]
 var ROTATIONS = [0, 1, 2, 3]
+// Same presets as Omarchy's display panel; each is rounded to a scale the
+// display's mode divides into cleanly.
+var SCALE_PRESETS = [1, 1.25, 1.6, 2, 3, 4]
+var TEXT_SIZE_STOPS = [9, 10, 11, 12, 14, 16, 20]
+var SOFTWARE_MIN_BRIGHTNESS = 10
 
 var STRINGS = {
   en: {
@@ -25,8 +30,15 @@ var STRINGS = {
     right: "Right",
     above: "Above",
     below: "Below",
+    displays: "Displays",
+    displaysHint: "Remembered per device",
+    brightness: "Brightness",
+    softwareDim: "dimmed in software",
+    detecting: "Checking brightness control…",
+    mirrorDim: "Follows the duplicated screen",
     rotation: "Rotation",
-    rotationHint: "Remembered per device",
+    scale: "Scale",
+    textSize: "Text size",
     laptop: "Laptop screen",
     off: "off",
     footer: "↑↓ Select · ←→ Change · Enter Apply · 1-4 Mode",
@@ -52,8 +64,15 @@ var STRINGS = {
     right: "Derecha",
     above: "Arriba",
     below: "Abajo",
+    displays: "Pantallas",
+    displaysHint: "Se recuerda por dispositivo",
+    brightness: "Brillo",
+    softwareDim: "atenuado por software",
+    detecting: "Comprobando el control de brillo…",
+    mirrorDim: "Sigue a la pantalla duplicada",
     rotation: "Giro",
-    rotationHint: "Se recuerda por dispositivo",
+    scale: "Escala",
+    textSize: "Tamaño del texto",
     laptop: "Pantalla del portátil",
     off: "apagada",
     footer: "↑↓ Elegir · ←→ Cambiar · Enter Aplicar · 1-4 Modo",
@@ -136,6 +155,93 @@ function parseState(raw) {
   return state
 }
 
+function clamp(value, low, high) {
+  var n = Number(value)
+  if (!isFinite(n)) n = high
+  return Math.max(low, Math.min(high, Math.round(n)))
+}
+
+function minBrightness(monitor) {
+  return monitor && monitor.brightnessBackend === "software" ? SOFTWARE_MIN_BRIGHTNESS : 1
+}
+
+// Opacity of the black layer that dims a display to `level` percent.
+function dimOpacity(level) {
+  return 1 - clamp(level, SOFTWARE_MIN_BRIGHTNESS, 100) / 100
+}
+
+// software-brightness.json: { "<output>": <level> }. Anything unexpected is
+// dropped, so a broken file leaves every display at full brightness.
+function parseLevels(raw) {
+  var parsed = null
+  try {
+    parsed = raw ? JSON.parse(String(raw)) : null
+  } catch (e) {
+    parsed = null
+  }
+  var levels = {}
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return levels
+  for (var name in parsed) {
+    var n = Number(parsed[name])
+    if (isFinite(n) && n < 100) levels[name] = clamp(n, SOFTWARE_MIN_BRIGHTNESS, 100)
+  }
+  return levels
+}
+
+function gcd(a, b) {
+  while (b) {
+    var r = a % b
+    a = b
+    b = r
+  }
+  return a
+}
+
+// Hyprland only accepts scales where the mode divides into whole logical
+// pixels (in 1/120 steps); round up to the nearest such value, as
+// omarchy-hyprland-monitor-scaling does.
+function cleanScale(scale, width, height) {
+  var w = Math.round(Number(width) * 120)
+  var h = Math.round(Number(height) * 120)
+  var k = Math.round(Number(scale) * 120)
+  if (!(w > 0 && h > 0 && k > 0)) return Number(scale) || 1
+  var g = gcd(w, h)
+  if (k > g) k = g
+  while (g % k !== 0) k++
+  return Math.round(k / 120 * 1000) / 1000
+}
+
+// Clean scales for a display, without duplicates, skipping any that would
+// leave less than 960 logical pixels across.
+function scaleOptions(monitor) {
+  var w = monitor ? Number(monitor.width) : 0
+  var h = monitor ? Number(monitor.height) : 0
+  var rotated = monitor && (Number(monitor.transform) % 2) === 1
+  var across = rotated ? h : w
+  var seen = {}
+  var list = []
+  for (var i = 0; i < SCALE_PRESETS.length; i++) {
+    var s = cleanScale(SCALE_PRESETS[i], w, h)
+    if (seen[s]) continue
+    if (across > 0 && i > 0 && across / s < 960) continue
+    seen[s] = true
+    list.push(s)
+  }
+  return list
+}
+
+function scaleLabel(scale) {
+  return String(Math.round(Number(scale) * 100) / 100) + "x"
+}
+
+function nearestIndex(list, value) {
+  var best = 0
+  for (var i = 1; i < list.length; i++) {
+    if (Math.abs(list[i] - value) < Math.abs(list[best] - value)) best = i
+  }
+  return best
+}
+
 function displayName(lang, monitor) {
   if (!monitor) return ""
   if (monitor.internal) return tr(lang, "laptop")
@@ -147,6 +253,9 @@ if (typeof module !== "undefined") {
     MODES: MODES,
     POSITIONS: POSITIONS,
     ROTATIONS: ROTATIONS,
+    SCALE_PRESETS: SCALE_PRESETS,
+    TEXT_SIZE_STOPS: TEXT_SIZE_STOPS,
+    SOFTWARE_MIN_BRIGHTNESS: SOFTWARE_MIN_BRIGHTNESS,
     STRINGS: STRINGS,
     language: language,
     tr: tr,
@@ -157,6 +266,14 @@ if (typeof module !== "undefined") {
     nextIndex: nextIndex,
     emptyState: emptyState,
     parseState: parseState,
-    displayName: displayName
+    displayName: displayName,
+    clamp: clamp,
+    minBrightness: minBrightness,
+    dimOpacity: dimOpacity,
+    parseLevels: parseLevels,
+    cleanScale: cleanScale,
+    scaleOptions: scaleOptions,
+    scaleLabel: scaleLabel,
+    nearestIndex: nearestIndex
   }
 }

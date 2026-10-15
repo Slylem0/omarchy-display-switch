@@ -8,16 +8,23 @@
 # reloads and reboots, and deleting the file (or `display-switch reset`) hands
 # control back to monitors.lua.
 #
-# Rotation is remembered per device (EDID description, or the port when a
-# display sends none), not per port, so a
-# portable monitor mounted upside down keeps its 180° while a projector plugged
-# into the same HDMI port comes up straight.
+# Rotation, scale and brightness are remembered per device (EDID description,
+# or the port when a display sends none), not per port, so a portable monitor
+# mounted upside down keeps its 180° while a projector plugged into the same
+# HDMI port comes up straight.
+#
+# Brightness uses the display's own backlight or DDC/CI through Omarchy's
+# omarchy-brightness-display when the display supports it. Displays that do
+# not (many portable monitors and projectors) are dimmed in software: the
+# plugin's shell service draws a click-through black layer over them, at the
+# levels this script writes to software-brightness.json.
 
 set -o pipefail
 
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 STATE_DIR="$STATE_HOME/display-switch"
 STATE_FILE="$STATE_DIR/state.json"
+DIM_FILE="$STATE_DIR/software-brightness.json"
 TOGGLES_DIR="$STATE_HOME/omarchy/toggles/hypr"
 RULES_FILE="$TOGGLES_DIR/display-switch.lua"
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/display-switch.lock"
@@ -62,11 +69,14 @@ mode_label() {
 
 notify() {
   [[ $DRY_RUN == 1 ]] && return 0
+  # A notification that can't be shown must not turn a change that worked
+  # into a failure.
   if command -v omarchy-notification-send >/dev/null 2>&1; then
-    omarchy-notification-send -g 󰍹 "$1"
+    omarchy-notification-send -g 󰍹 "$1" >/dev/null 2>&1
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "$1"
+    notify-send "$1" >/dev/null 2>&1
   fi
+  return 0
 }
 
 fail() {
@@ -122,6 +132,7 @@ JQ_PRELUDE='
      elif $e.y + ($e | logical_h) <= $p.y + 1 then "above"
      else ($state.position // "right") end) as $position
   | def rotation: ($devices[key].transform // 0);
+  def scale_value: ($devices[key].scale // .scale // 1) | if . <= 0 then 1 else . end;
 '
 
 query() {
@@ -157,7 +168,6 @@ layout_rows() {
       if (.disabled != true) and ((.mirrorOf // "none") == "none") and ((.width // 0) > 0)
       then "\(.width)x\(.height)@\(((.refreshRate // 60) * 100 | round) / 100)"
       else "preferred" end;
-    def scale_value: (.scale // 1) | if . <= 0 then 1 else . end;
     def on($pos): [.name, mode_string, $pos, scale_value, rotation, "", false];
     def mirror_of($src): [.name, "preferred", "auto", scale_value, rotation, $src, false];
     def off: [.name, "", "", "", "", "", true];
@@ -218,6 +228,20 @@ apply_layout() {
   hyprctl reload >/dev/null
 }
 
+# Software brightness levels for the connected outputs, by port name, for the
+# shell service that draws the dimming layers. Only levels below 100 are listed.
+write_dim() {
+  local monitors="$1" state="$2" levels tmp
+  [[ $DRY_RUN == 1 ]] && return 0
+  levels=$(query "$monitors" "$state" '
+    [$all[] | select(.disabled != true and $devices[key].backend == "software")
+      | {key: .name, value: ($devices[key].dim // 100)} | select(.value < 100)]
+    | from_entries') || return 0
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/.dim.XXXXXX") || return 0
+  printf '%s\n' "$levels" >"$tmp" && mv -f "$tmp" "$DIM_FILE"
+}
+
 # Re-reads monitors and stored state, records the given changes, and applies.
 commit() {
   local state="$1" mode="$2" position="$3" monitors
@@ -225,7 +249,14 @@ commit() {
   state=$(query "$monitors" "$state" '$state | .mode = $m | .position = $pos | .connected = ([$all[] | key] | sort)' \
     --arg m "$mode" --arg pos "$position")
   [[ $DRY_RUN == 1 ]] || write_state "$state"
+  write_dim "$monitors" "$state"
   apply_layout "$monitors" "$state" "$mode" "$position"
+}
+
+# Serialises everything that rewrites the state file.
+lock() {
+  exec 9>"$LOCK_FILE"
+  flock -w 5 9 || fail "busy, try again"
 }
 
 load() {
@@ -242,8 +273,9 @@ valid_mode() {
 }
 
 cmd_state() {
+  local json name value levels='{}'
   load
-  query "$MONITORS" "$STATE" '{
+  json=$(query "$MONITORS" "$STATE" '{
     mode: $detected,
     storedMode: ($state.mode // "extend"),
     position: $position,
@@ -257,14 +289,42 @@ cmd_state() {
       primary: (.name == $p.name),
       enabled: (.disabled != true),
       mirrorOf: (.mirrorOf // "none"),
-      transform: ($devices[key].transform // .transform // 0)
+      transform: ($devices[key].transform // .transform // 0),
+      scale: ((.scale // 1) | if . <= 0 then 1 else . end),
+      width: (.width // 0),
+      height: (.height // 0),
+      brightnessBackend: ($devices[key].backend // "unknown"),
+      brightness: (if $devices[key].backend == "software" then ($devices[key].dim // 100) else null end)
     }]
-  }' -c
+  }' -c) || exit 1
+
+  # Hardware brightness is read live: the backlight or DDC/CI value can change
+  # from the brightness keys or the monitor's own buttons.
+  while read -r name; do
+    [[ -n $name ]] || continue
+    value=$(hardware_brightness "$name") || continue
+    levels=$(jq -c --arg n "$name" --argjson v "$value" '.[$n] = $v' <<<"$levels")
+  done < <(jq -r '.monitors[] | select(.enabled and .brightnessBackend == "hardware") | .name' <<<"$json")
+
+  jq -c --argjson levels "$levels" '.monitors |= map(if $levels[.name] != null then .brightness = $levels[.name] else . end)' <<<"$json"
+}
+
+# Prints the hardware brightness (1-100) of an output, or fails when the
+# display has no backlight or DDC/CI control. A display without DDC/CI can take
+# several seconds to time out, which is why the answer is probed once per
+# device and remembered.
+hardware_brightness() {
+  local value
+  [[ -n ${DISPLAY_SWITCH_BRIGHTNESS_CMD:-} ]] || command -v omarchy-brightness-display >/dev/null 2>&1 || return 1
+  value=$(timeout 20 ${DISPLAY_SWITCH_BRIGHTNESS_CMD:-omarchy-brightness-display} --monitor "$1" 2>/dev/null | head -n 1)
+  [[ $value =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$value"
 }
 
 cmd_mode() {
   local mode="$1"
   valid_mode "$mode" || fail "unknown mode '$mode' (expected: ${MODES[*]})"
+  [[ $DRY_RUN == 1 ]] || lock
   load
   if [[ $DETECTED == single && $mode != pc ]]; then
     if spanish; then notify "No hay ninguna pantalla externa conectada"; else notify "No external display connected"; fi
@@ -290,6 +350,7 @@ cmd_cycle() {
 cmd_position() {
   local position="$1"
   [[ $position =~ ^(left|right|above|below)$ ]] || fail "unknown position '$position' (expected: left right above below)"
+  [[ $DRY_RUN == 1 ]] || lock
   load
   [[ $DETECTED == single ]] && fail "no external display connected"
   # Picking a side only means something while extended, as in Windows.
@@ -299,13 +360,85 @@ cmd_position() {
 cmd_rotate() {
   local output="$1" transform="$2" device mode
   [[ $transform =~ ^[0-7]$ ]] || fail "transform must be 0-7 (0 normal, 1 90°, 2 180°, 3 270°, 4-7 flipped)"
+  [[ $DRY_RUN == 1 ]] || lock
   load
   device=$(query "$MONITORS" "$STATE" '[$all[] | select(.name == $name) | key][0] // empty' --arg name "$output" -r)
   [[ -n $device ]] || fail "unknown output '$output'"
-  STATE=$(jq --arg d "$device" --argjson t "$transform" '.devices[$d] = {transform: $t}' <<<"$STATE")
+  STATE=$(jq --arg d "$device" --argjson t "$transform" '.devices[$d].transform = $t' <<<"$STATE")
   mode=$DETECTED
   [[ $mode == single ]] && mode=$(jq -r '.mode // "extend"' <<<"$STATE")
   commit "$STATE" "$mode" "$POSITION"
+}
+
+device_key() {
+  query "$MONITORS" "$STATE" '[$all[] | select(.name == $name) | key][0] // empty' --arg name "$1" -r
+}
+
+cmd_scale() {
+  local output="$1" scale="$2" device mode
+  [[ $scale =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v s="$scale" 'BEGIN { exit !(s >= 0.5 && s <= 4) }' ||
+    fail "scale must be a number between 0.5 and 4"
+  [[ $DRY_RUN == 1 ]] || lock
+  load
+  device=$(device_key "$output")
+  [[ -n $device ]] || fail "unknown output '$output'"
+  STATE=$(jq --arg d "$device" --argjson s "$scale" '.devices[$d].scale = $s' <<<"$STATE")
+  mode=$DETECTED
+  [[ $mode == single ]] && mode=$(jq -r '.mode // "extend"' <<<"$STATE")
+  commit "$STATE" "$mode" "$POSITION"
+}
+
+# Finds out once per device whether it has hardware brightness control.
+# The slow part runs before taking the lock so other commands are not held up.
+cmd_probe() {
+  local name backend results='{}'
+  load
+  while read -r name; do
+    [[ -n $name ]] || continue
+    if hardware_brightness "$name" >/dev/null; then backend=hardware; else backend=software; fi
+    results=$(jq -c --arg d "$(device_key "$name")" --arg b "$backend" '.[$d] = $b' <<<"$results")
+  done < <(query "$MONITORS" "$STATE" '$all[] | select(.disabled != true and ($devices[key].backend // "") == "") | .name' -r)
+  [[ $results == '{}' ]] && return 0
+
+  [[ $DRY_RUN == 1 ]] || lock
+  load
+  STATE=$(jq --argjson r "$results" 'reduce ($r | to_entries[]) as $e (.; .devices[$e.key].backend = $e.value)' <<<"$STATE")
+  if [[ $DRY_RUN == 1 ]]; then
+    jq -c . <<<"$STATE"
+  else
+    write_state "$STATE"
+    write_dim "$MONITORS" "$STATE"
+  fi
+}
+
+cmd_brightness() {
+  local output="$1" level="$2" device backend
+  [[ $level =~ ^[0-9]+$ ]] && ((level >= 1 && level <= 100)) || fail "brightness must be 1-100"
+  load
+  device=$(device_key "$output")
+  [[ -n $device ]] || fail "unknown output '$output'"
+  backend=$(jq -r --arg d "$device" '.devices[$d].backend // empty' <<<"$STATE")
+  if [[ -z $backend ]]; then
+    if hardware_brightness "$output" >/dev/null; then backend=hardware; else backend=software; fi
+  fi
+
+  if [[ $backend == hardware ]]; then
+    ${DISPLAY_SWITCH_BRIGHTNESS_CMD:-omarchy-brightness-display} --no-osd --monitor "$output" "$level%" >/dev/null ||
+      fail "could not set the brightness of $output"
+  fi
+
+  # Software dimming never goes fully black, so a display can't be lost.
+  ((level < 10)) && [[ $backend == software ]] && level=10
+  [[ $DRY_RUN == 1 ]] || lock
+  load
+  STATE=$(jq --arg d "$device" --arg b "$backend" --argjson l "$level" '
+    .devices[$d].backend = $b | if $b == "software" then .devices[$d].dim = $l else . end' <<<"$STATE")
+  if [[ $DRY_RUN == 1 ]]; then
+    jq -c . <<<"$STATE"
+  else
+    write_state "$STATE"
+    write_dim "$MONITORS" "$STATE"
+  fi
 }
 
 # Called by the bar widget whenever Hyprland adds or removes an output. It only
@@ -320,14 +453,18 @@ cmd_sync() {
   connected=$(query "$MONITORS" "$STATE" '[$all[] | key] | sort' -c)
   if ((first_run)); then
     [[ $DRY_RUN == 1 ]] || write_state "$STATE"
+    write_dim "$MONITORS" "$STATE"
     return 0
   fi
-  jq -e --argjson c "$connected" '.connected == $c' <<<"$STATE" >/dev/null && return 0
+  if jq -e --argjson c "$connected" '.connected == $c' <<<"$STATE" >/dev/null; then
+    write_dim "$MONITORS" "$STATE"
+    return 0
+  fi
   commit "$STATE" "$(jq -r '.mode // "extend"' <<<"$STATE")" "$(jq -r '.position // "right"' <<<"$STATE")"
 }
 
 cmd_reset() {
-  rm -f "$RULES_FILE"
+  rm -f "$RULES_FILE" "$DIM_FILE"
   hyprctl reload >/dev/null
   if spanish; then notify "Configuración de pantallas restablecida"; else notify "Display layout reset to monitors.lua"; fi
 }
@@ -341,6 +478,10 @@ Usage: display-switch <command>
   position <left|right|above|below>  Where the external display sits when extended
   rotate <output> <0-7>              Rotate a display; remembered per device
                                      (0 normal, 1 90°, 2 180°, 3 270°, 4-7 flipped)
+  scale <output> <0.5-4>             Set a display's scale; remembered per device
+  brightness <output> <1-100>        Set a display's brightness (backlight or
+                                     DDC/CI when available, otherwise software)
+  probe                              Detect which displays have hardware brightness
   state                              Print the current state as JSON
   sync                               Re-apply after a display was (dis)connected
   reset                              Remove the generated rules, back to monitors.lua
@@ -355,6 +496,9 @@ case "${1:-}" in
   cycle) cmd_cycle ;;
   position) cmd_position "${2:-}" ;;
   rotate) cmd_rotate "${2:-}" "${3:-}" ;;
+  scale) cmd_scale "${2:-}" "${3:-}" ;;
+  brightness) cmd_brightness "${2:-}" "${3:-}" ;;
+  probe) cmd_probe ;;
   state) cmd_state ;;
   sync) cmd_sync ;;
   reset) cmd_reset ;;

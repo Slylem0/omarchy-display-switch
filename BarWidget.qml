@@ -36,6 +36,37 @@ BarWidget {
   function cycleMode() { run(["cycle"]) }
   function setPosition(position) { run(["position", position]) }
   function rotate(output, transform) { run(["rotate", output, String(transform)]) }
+  function setScale(output, scale) { run(["scale", output, String(scale)]) }
+
+  // Brightness does not reload Hyprland, so it runs attached and in order:
+  // while one change is in flight only the latest requested level is kept.
+  property var pendingBrightness: null
+  function setBrightness(output, level) {
+    var value = Model.clamp(level, 1, 100)
+    patchMonitor(output, { brightness: value })
+    pendingBrightness = { output: output, level: value }
+    if (!brightnessProcess.running) flushBrightness()
+  }
+  function flushBrightness() {
+    if (!pendingBrightness) return
+    brightnessProcess.command = [root.helper, "brightness", pendingBrightness.output, String(pendingBrightness.level)]
+    pendingBrightness = null
+    brightnessProcess.running = true
+  }
+
+  // Show a change right away instead of waiting for the next state read.
+  function patchMonitor(output, fields) {
+    var next = JSON.parse(JSON.stringify(root.status))
+    for (var i = 0; i < next.monitors.length; i++) {
+      if (next.monitors[i].name !== output) continue
+      for (var key in fields) next.monitors[i][key] = fields[key]
+    }
+    root.status = next
+  }
+
+  function setTextSize(px) {
+    Quickshell.execDetached(["omarchy-display-text-size", String(px)])
+  }
 
   function open() { if (panelLoader.item) panelLoader.item.open() }
   function close() { if (panelLoader.item) panelLoader.item.close() }
@@ -97,7 +128,31 @@ BarWidget {
     command: [root.helper, "state"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: if (root.alive) root.status = Model.parseState(text)
+      onStreamFinished: {
+        if (!root.alive) return
+        // Keep a level the user just picked until the helper has stored it.
+        if (brightnessProcess.running || root.pendingBrightness) return
+        root.status = Model.parseState(text)
+        var unknown = root.status.monitors.some(function(m) { return m.enabled && m.brightnessBackend === "unknown" })
+        if (unknown && !probeProcess.running) probeProcess.running = true
+      }
+    }
+  }
+
+  // Finds out once per display whether it has hardware brightness control.
+  // A display without DDC/CI can take several seconds to answer.
+  Process {
+    id: probeProcess
+    command: [root.helper, "probe"]
+    onRunningChanged: if (!running && root.alive) root.refresh()
+  }
+
+  Process {
+    id: brightnessProcess
+    onRunningChanged: {
+      if (running || !root.alive) return
+      if (root.pendingBrightness) root.flushBrightness()
+      else root.refresh()
     }
   }
 
@@ -128,5 +183,6 @@ BarWidget {
   Component.onDestruction: {
     alive = false
     stateProcess.running = false
+    probeProcess.running = false
   }
 }

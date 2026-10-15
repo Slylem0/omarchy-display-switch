@@ -35,6 +35,24 @@ const cases = {
   "glyphs are single code points": () => {
     assert.strictEqual(Model.glyph(0xF0379).codePointAt(0), 0xF0379)
   },
+  "software brightness levels": () => {
+    assert.deepStrictEqual(Model.parseLevels('{"HDMI-A-1":70,"DP-1":100,"x":"y","DP-2":2}'), { "HDMI-A-1": 70, "DP-2": 10 })
+    assert.deepStrictEqual(Model.parseLevels("[1,2]"), {})
+    assert.deepStrictEqual(Model.parseLevels("garbage"), {})
+    assert.ok(Math.abs(Model.dimOpacity(70) - 0.3) < 1e-9)
+    assert.ok(Math.abs(Model.dimOpacity(0) - 0.9) < 1e-9)
+    assert.strictEqual(Model.minBrightness({ brightnessBackend: "software" }), 10)
+    assert.strictEqual(Model.minBrightness({ brightnessBackend: "hardware" }), 1)
+  },
+  "scales are clean for the mode": () => {
+    assert.strictEqual(Model.cleanScale(1.6, 1920, 1080), 1.6)
+    assert.strictEqual(Model.cleanScale(1.25, 1920, 1080), 1.25)
+    assert.strictEqual(Model.cleanScale(1.6, 2560, 1600), 1.6)
+    assert.deepStrictEqual(Model.scaleOptions({ width: 1920, height: 1080, transform: 0 }), [1, 1.25, 1.6, 2])
+    assert.deepStrictEqual(Model.scaleOptions({ width: 3840, height: 2160, transform: 0 }), [1, 1.25, 1.6, 2, 3, 4])
+    assert.strictEqual(Model.scaleLabel(1.25), "1.25x")
+    assert.strictEqual(Model.nearestIndex([1, 1.25, 1.6, 2], 1.5), 2)
+  },
   "laptop gets a friendly name": () => {
     assert.strictEqual(Model.displayName("es", { internal: true, name: "eDP-1" }), "Pantalla del portátil")
     assert.strictEqual(Model.displayName("en", { internal: false, label: "GWD ARZOPA", name: "HDMI-A-1" }), "GWD ARZOPA")
