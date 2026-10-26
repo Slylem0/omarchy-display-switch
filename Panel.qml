@@ -4,6 +4,7 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -22,8 +23,8 @@ Panel {
   readonly property bool hasExternal: status.hasExternal
   readonly property bool showPosition: hasExternal && status.mode === "extend"
   readonly property var displays: status.monitors.filter(function(m) { return m.enabled })
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color accent: Color.accent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color accent: Commons.Color.accent
   readonly property color dim: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.65)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property int inset: Style.space(14)
